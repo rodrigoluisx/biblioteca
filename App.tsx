@@ -1,10 +1,17 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert, FlatList, KeyboardAvoidingView, KeyboardTypeOptions, Modal, Platform,
   ScrollView, StatusBar, StyleSheet, Text, TextInput, TouchableOpacity, View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import AsyncStorage from '@react-native-async-storage/async-storage';
+import {
+  createUserWithEmailAndPassword, onAuthStateChanged, signInWithEmailAndPassword, signOut,
+} from 'firebase/auth';
+import {
+  addDoc, collection, deleteDoc, doc, getDoc, onSnapshot, orderBy, query,
+  serverTimestamp, setDoc, updateDoc,
+} from 'firebase/firestore';
+import { auth, db } from './firebaseConfig';
 
 type BookForm = {
   name: string;
@@ -15,18 +22,12 @@ type BookForm = {
   pages: string;
 };
 type Book = BookForm & { id: string };
-type StoredUser = { name: string; pass: string };
-type Session = { name: string; admin: boolean };
+type Session = { uid: string; name: string; admin: boolean };
 
-const BK = '@biblioteca:books';
-const UK = '@biblioteca:users';
-const ADMIN = 'admin';
-const ADMIN_PASS = '4321';
-
-const seed: Book[] = [
-  { id: '1', name: 'Dom Casmurro', year: '1899', writer: 'Machado de Assis', publisher: 'Garnier', genre: 'Romance', pages: '256' },
-  { id: '2', name: 'O Pequeno Príncipe', year: '1943', writer: 'Antoine de Saint-Exupéry', publisher: 'Reynal & Hitchcock', genre: 'Fábula', pages: '96' },
-  { id: '3', name: 'A Hora da Estrela', year: '1977', writer: 'Clarice Lispector', publisher: 'Rocco', genre: 'Romance', pages: '88' },
+const seed: BookForm[] = [
+  { name: 'Dom Casmurro', year: '1899', writer: 'Machado de Assis', publisher: 'Garnier', genre: 'Romance', pages: '256' },
+  { name: 'O Pequeno Príncipe', year: '1943', writer: 'Antoine de Saint-Exupéry', publisher: 'Reynal & Hitchcock', genre: 'Fábula', pages: '96' },
+  { name: 'A Hora da Estrela', year: '1977', writer: 'Clarice Lispector', publisher: 'Rocco', genre: 'Romance', pages: '88' },
 ];
 const blank: BookForm = { name: '', year: '', writer: '', publisher: '', genre: '', pages: '' };
 const fields: [keyof BookForm, string][] = [
@@ -37,6 +38,29 @@ const fields: [keyof BookForm, string][] = [
   ['genre', 'Gênero'],
   ['pages', 'Número de páginas'],
 ];
+
+function friendlyError(e: unknown): string {
+  const code = (e as { code?: string })?.code ?? '';
+  switch (code) {
+    case 'auth/invalid-credential':
+    case 'auth/wrong-password':
+    case 'auth/user-not-found':
+      return 'E-mail ou senha incorretos.';
+    case 'auth/invalid-email':
+      return 'E-mail inválido.';
+    case 'auth/email-already-in-use':
+      return 'Este e-mail já está cadastrado.';
+    case 'auth/weak-password':
+      return 'A senha precisa ter pelo menos 6 caracteres.';
+    case 'auth/network-request-failed':
+    case 'unavailable':
+      return 'Sem conexão com a internet.';
+    case 'permission-denied':
+      return 'Você não tem permissão para fazer isso.';
+    default:
+      return 'Algo deu errado. Tente novamente.';
+  }
+}
 
 type InputProps = {
   label: string;
@@ -65,53 +89,85 @@ function Input({ label, value, onChangeText, keyboardType, secureTextEntry, auto
   );
 }
 
-type ButtonProps = { title: string; onPress: () => void; small?: boolean; outline?: boolean };
+type ButtonProps = { title: string; onPress: () => void; small?: boolean; outline?: boolean; disabled?: boolean };
 
-function Button({ title, onPress, small, outline }: ButtonProps) {
+function Button({ title, onPress, small, outline, disabled }: ButtonProps) {
   return (
-    <TouchableOpacity onPress={onPress} style={[s.button, small && s.small, outline && s.outline]}>
+    <TouchableOpacity
+      onPress={onPress}
+      disabled={disabled}
+      style={[s.button, small && s.small, outline && s.outline, disabled && s.disabled]}
+    >
       <Text style={[s.buttonText, outline && s.outlineText]}>{title}</Text>
     </TouchableOpacity>
   );
 }
 
 export default function App() {
-  const [ready, setReady] = useState<boolean>(false);
-  const [books, setBooks] = useState<Book[]>(seed);
-  const [users, setUsers] = useState<StoredUser[]>([]);
+  const [authReady, setAuthReady] = useState<boolean>(false);
+  const [busy, setBusy] = useState<boolean>(false);
+  const [books, setBooks] = useState<Book[]>([]);
   const [user, setUser] = useState<Session | null>(null);
   const [name, setName] = useState<string>('');
+  const [email, setEmail] = useState<string>('');
   const [pass, setPass] = useState<string>('');
   const [register, setRegister] = useState<boolean>(false);
   const [search, setSearch] = useState<string>('');
   const [modal, setModal] = useState<boolean>(false);
   const [editId, setEditId] = useState<string | null>(null);
   const [form, setForm] = useState<BookForm>(blank);
+  const signingUp = useRef<boolean>(false);
 
+  // Mantém o login entre aberturas do app e descobre se o usuário é admin.
   useEffect(() => {
-    (async () => {
-      try {
-        const b = await AsyncStorage.getItem(BK);
-        const u = await AsyncStorage.getItem(UK);
-        if (b) setBooks(JSON.parse(b) as Book[]);
-        else await AsyncStorage.setItem(BK, JSON.stringify(seed));
-        if (u) setUsers(JSON.parse(u) as StoredUser[]);
-      } catch {
-        Alert.alert('Aviso', 'Não foi possível carregar os dados.');
-      } finally {
-        setReady(true);
+    const unsub = onAuthStateChanged(auth, async (fu) => {
+      if (signingUp.current) return; // o cadastro define o usuário sozinho
+      if (!fu) {
+        setUser(null);
+        setAuthReady(true);
+        return;
       }
-    })();
+      try {
+        const snap = await getDoc(doc(db, 'usuarios', fu.uid));
+        const d = snap.data() as { nome?: string; role?: string } | undefined;
+        setUser({ uid: fu.uid, name: d?.nome ?? fu.email ?? 'Leitor', admin: d?.role === 'admin' });
+      } catch {
+        setUser({ uid: fu.uid, name: fu.email ?? 'Leitor', admin: false });
+      }
+      setAuthReady(true);
+    });
+    return unsub;
   }, []);
 
-  const persistBooks = async (v: Book[]) => {
-    setBooks(v);
-    await AsyncStorage.setItem(BK, JSON.stringify(v));
-  };
-  const persistUsers = async (v: StoredUser[]) => {
-    setUsers(v);
-    await AsyncStorage.setItem(UK, JSON.stringify(v));
-  };
+  // Escuta a coleção de livros em tempo real enquanto houver usuário logado.
+  useEffect(() => {
+    if (!user) {
+      setBooks([]);
+      return;
+    }
+    const q = query(collection(db, 'livros'), orderBy('createdAt', 'desc'));
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        setBooks(
+          snap.docs.map((d) => {
+            const x = d.data() as Partial<BookForm>;
+            return {
+              id: d.id,
+              name: x.name ?? '',
+              year: x.year ?? '',
+              writer: x.writer ?? '',
+              publisher: x.publisher ?? '',
+              genre: x.genre ?? '',
+              pages: x.pages ?? '',
+            };
+          })
+        );
+      },
+      () => Alert.alert('Erro', 'Não foi possível carregar os livros.')
+    );
+    return unsub;
+  }, [user?.uid]);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -120,35 +176,50 @@ export default function App() {
     );
   }, [books, search]);
 
-  const enter = () => {
-    const n = name.trim();
-    if (n.toLowerCase() === ADMIN && pass === ADMIN_PASS) {
-      setUser({ name: ADMIN, admin: true });
-      setPass('');
+  const enter = async () => {
+    if (!email.trim() || !pass) {
+      Alert.alert('Dados inválidos', 'Informe e-mail e senha.');
       return;
     }
-    const u = users.find((x) => x.name.toLowerCase() === n.toLowerCase() && x.pass === pass);
-    if (u) {
-      setUser({ name: u.name, admin: false });
+    setBusy(true);
+    try {
+      await signInWithEmailAndPassword(auth, email.trim(), pass);
       setPass('');
-    } else {
-      Alert.alert('Acesso não autorizado', 'Confira seus dados ou crie uma conta.');
+    } catch (e) {
+      Alert.alert('Acesso não autorizado', friendlyError(e));
+    } finally {
+      setBusy(false);
     }
   };
 
   const signup = async () => {
     const n = name.trim();
-    if (n.length < 3 || pass.length < 4) {
-      Alert.alert('Dados inválidos', 'Use usuário com 3 caracteres e senha com 4.');
+    const em = email.trim();
+    if (n.length < 3 || !em || pass.length < 6) {
+      Alert.alert('Dados inválidos', 'Informe nome (3+ letras), e-mail e senha (6+ caracteres).');
       return;
     }
-    if (n.toLowerCase() === ADMIN || users.some((x) => x.name.toLowerCase() === n.toLowerCase())) {
-      Alert.alert('Usuário indisponível', 'Escolha outro nome.');
-      return;
+    setBusy(true);
+    signingUp.current = true;
+    try {
+      const cred = await createUserWithEmailAndPassword(auth, em, pass);
+      await setDoc(doc(db, 'usuarios', cred.user.uid), { nome: n, email: em, role: 'leitor' });
+      setUser({ uid: cred.user.uid, name: n, admin: false });
+      setPass('');
+    } catch (e) {
+      Alert.alert('Não foi possível criar a conta', friendlyError(e));
+    } finally {
+      signingUp.current = false;
+      setBusy(false);
     }
-    await persistUsers([...users, { name: n, pass }]);
-    setUser({ name: n, admin: false });
+  };
+
+  const logout = async () => {
+    await signOut(auth);
+    setName('');
+    setEmail('');
     setPass('');
+    setSearch('');
   };
 
   const startEdit = (b: Book | null) => {
@@ -170,20 +241,56 @@ export default function App() {
       Alert.alert('Dados inválidos', 'Informe ano com quatro dígitos e páginas válidas.');
       return;
     }
-    const next: Book[] = editId
-      ? books.map((b) => (b.id === editId ? { ...form, id: editId } : b))
-      : [{ ...form, id: String(Date.now()) }, ...books];
-    await persistBooks(next);
-    setModal(false);
+    const payload: BookForm = {
+      name: form.name.trim(),
+      year: form.year.trim(),
+      writer: form.writer.trim(),
+      publisher: form.publisher.trim(),
+      genre: form.genre.trim(),
+      pages: form.pages.trim(),
+    };
+    setBusy(true);
+    try {
+      if (editId) await updateDoc(doc(db, 'livros', editId), payload);
+      else await addDoc(collection(db, 'livros'), { ...payload, createdAt: serverTimestamp() });
+      setModal(false);
+    } catch (e) {
+      Alert.alert('Erro ao salvar', friendlyError(e));
+    } finally {
+      setBusy(false);
+    }
   };
 
   const remove = (b: Book) =>
     Alert.alert('Remover livro', `Deseja remover "${b.name}"?`, [
       { text: 'Cancelar', style: 'cancel' },
-      { text: 'Remover', style: 'destructive', onPress: () => persistBooks(books.filter((x) => x.id !== b.id)) },
+      {
+        text: 'Remover',
+        style: 'destructive',
+        onPress: async () => {
+          try {
+            await deleteDoc(doc(db, 'livros', b.id));
+          } catch (e) {
+            Alert.alert('Erro ao remover', friendlyError(e));
+          }
+        },
+      },
     ]);
 
-  if (!ready) {
+  const importSeed = async () => {
+    setBusy(true);
+    try {
+      for (const b of seed) {
+        await addDoc(collection(db, 'livros'), { ...b, createdAt: serverTimestamp() });
+      }
+    } catch (e) {
+      Alert.alert('Erro ao importar', friendlyError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!authReady) {
     return (
       <SafeAreaView style={s.center}>
         <Text>Carregando biblioteca...</Text>
@@ -203,14 +310,18 @@ export default function App() {
             {register ? 'Cadastre-se para consultar o catálogo.' : 'Entre para descobrir sua próxima leitura.'}
           </Text>
           <View style={s.card}>
-            <Input label="Usuário" value={name} onChangeText={setName} autoCapitalize="none" />
+            {register && <Input label="Nome" value={name} onChangeText={setName} />}
+            <Input label="E-mail" value={email} onChangeText={setEmail} keyboardType="email-address" autoCapitalize="none" />
             <Input label="Senha" value={pass} onChangeText={setPass} secureTextEntry autoCapitalize="none" />
-            <Button title={register ? 'Criar conta' : 'Entrar'} onPress={register ? signup : enter} />
+            <Button
+              title={busy ? 'Aguarde...' : register ? 'Criar conta' : 'Entrar'}
+              onPress={register ? signup : enter}
+              disabled={busy}
+            />
             <TouchableOpacity onPress={() => setRegister(!register)} style={{ padding: 16, alignItems: 'center' }}>
               <Text style={s.link}>{register ? 'Já tenho uma conta · Entrar' : 'Não tem conta? Criar usuário'}</Text>
             </TouchableOpacity>
           </View>
-          <Text style={s.hint}>Administrador: admin / 4321</Text>
         </KeyboardAvoidingView>
       </SafeAreaView>
     );
@@ -232,7 +343,7 @@ export default function App() {
           <Text style={s.welcomeTitle}>Olá, {user.name} 👋</Text>
           <Text style={s.muted}>Explore os livros disponíveis.</Text>
         </View>
-        <TouchableOpacity onPress={() => { setUser(null); setName(''); setPass(''); setSearch(''); }}>
+        <TouchableOpacity onPress={logout}>
           <Text style={s.logout}>Sair</Text>
         </TouchableOpacity>
       </View>
@@ -260,7 +371,14 @@ export default function App() {
         data={filtered}
         keyExtractor={(x) => x.id}
         contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: 28, flexGrow: 1 }}
-        ListEmptyComponent={<Text style={s.empty}>Nenhum livro encontrado.</Text>}
+        ListEmptyComponent={
+          <View>
+            <Text style={s.empty}>Nenhum livro encontrado.</Text>
+            {user.admin && books.length === 0 && (
+              <Button title="Importar livros de exemplo" onPress={importSeed} outline disabled={busy} />
+            )}
+          </View>
+        }
         renderItem={({ item }) => (
           <View style={s.book}>
             <View style={s.cover}><Text style={{ fontSize: 25, color: '#55735D' }}>▤</Text></View>
@@ -300,7 +418,11 @@ export default function App() {
                   onChangeText={(v) => setForm((old) => ({ ...old, [k]: v }))}
                 />
               ))}
-              <Button title={editId ? 'Salvar alterações' : 'Cadastrar livro'} onPress={save} />
+              <Button
+                title={busy ? 'Salvando...' : editId ? 'Salvar alterações' : 'Cadastrar livro'}
+                onPress={save}
+                disabled={busy}
+              />
               <View style={{ height: 20 }} />
             </ScrollView>
           </View>
@@ -327,8 +449,8 @@ const s = StyleSheet.create({
   small: { paddingVertical: 11, paddingHorizontal: 13 },
   outline: { backgroundColor: '#E7EEE6' },
   outlineText: { color: '#365B48' },
+  disabled: { opacity: 0.5 },
   link: { color: '#52745C', fontWeight: '800', fontSize: 12 },
-  hint: { textAlign: 'center', color: '#92988F', fontSize: 11, marginTop: 20 },
   top: { paddingHorizontal: 22, paddingTop: 17, paddingBottom: 8, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   title: { color: '#24372D', fontSize: 31, fontWeight: '800' },
   role: { backgroundColor: '#E0EADF', color: '#45644D', fontSize: 10, fontWeight: '900', padding: 9, borderRadius: 18, overflow: 'hidden' },
@@ -347,7 +469,7 @@ const s = StyleSheet.create({
   publisher: { color: '#9A9F98', fontSize: 10, marginTop: 4 },
   actions: { flexDirection: 'row', gap: 18, marginTop: 11, paddingTop: 9, borderTopWidth: 1, borderTopColor: '#EEF0EB' },
   delete: { color: '#A64D43', fontWeight: '800', fontSize: 12 },
-  empty: { textAlign: 'center', color: '#788078', marginTop: 50 },
+  empty: { textAlign: 'center', color: '#788078', marginTop: 50, marginBottom: 16 },
   backdrop: { flex: 1, backgroundColor: 'rgba(20,32,24,.4)', justifyContent: 'flex-end' },
   modal: { backgroundColor: '#F9FAF7', borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 21, maxHeight: '92%' },
   modalHead: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 },
