@@ -5,11 +5,8 @@
     "version": "1.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
-    "ios": {
-      "supportsTablet": true
-    },
-    "web": {
-      "bundler": "metro"
-    }
+    "ios": { "supportsTablet": true, "bundleIdentifier": "com.rodri.biblioteca" },
+    "android": { "package": "com.rodri.biblioteca" },
+    "web": { "bundler": "metro" }
   }
 }
